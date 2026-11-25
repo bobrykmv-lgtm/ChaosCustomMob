@@ -1,0 +1,7 @@
+settings:
+  auto-spawn-on-start: true
+  default-respawn-seconds: 60
+
+messages:
+  prefix: "&8[&dChaosCustomMob&8] &r"
+  reloaded: "&aПапки и файлы NPC перезагружены!"
