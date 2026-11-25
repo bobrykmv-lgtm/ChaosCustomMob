@@ -5,6 +5,7 @@ import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
@@ -12,7 +13,6 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
-import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Entity;
@@ -300,6 +300,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         };
     }
 
+    @SuppressWarnings("deprecation")
     private PotionEffectType parseEffectType(String raw) {
         String normalized = raw.trim().toUpperCase(Locale.ROOT);
         if (normalized.equals("SLOWNESS")) {
@@ -310,7 +311,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             return byName;
         }
         NamespacedKey key = NamespacedKey.minecraft(raw.trim().toLowerCase(Locale.ROOT));
-        return org.bukkit.Registry.EFFECT.get(key);
+        return Registry.EFFECT.get(key);
     }
 
     private ItemStack parseItem(String materialName) {
@@ -324,6 +325,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         }
     }
 
+    @SuppressWarnings("deprecation")
     private String color(String text) {
         return ChatColor.translateAlternateColorCodes('&', text == null ? "" : text);
     }
@@ -467,7 +469,6 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
 
     @EventHandler
     public void onEntityDamageByEntity(EntityDamageByEntityEvent event) {
-        // Если NPC атакует игрока — накладываем настроенные эффекты
         if (event.getDamager() instanceof LivingEntity attacker && event.getEntity() instanceof Player target) {
             String npcId = attacker.getPersistentDataContainer().get(npcIdKey, PersistentDataType.STRING);
             if (npcId != null) {
@@ -480,7 +481,6 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             }
         }
 
-        // Если игрок ударил нейтрального NPC — NPC отвечает атакой
         if (event.getEntity() instanceof Mob victim && event.getDamager() instanceof Player attacker) {
             String npcId = victim.getPersistentDataContainer().get(npcIdKey, PersistentDataType.STRING);
             if (npcId != null) {
