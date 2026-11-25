@@ -251,19 +251,28 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             }
 
             List<AttackEffectSpec> attackEffects = new ArrayList<>();
-            List> effectMaps = cfg.getMapList("actions.on-attack-hit");
-            for (Map<?, ?> entry : effectMaps) {
-                Object effObj = entry.get("effect");
-                if (effObj == null) {
-                    continue;
+            List<?> rawEffects = cfg.getList("actions.on-attack-hit");
+            if (rawEffects != null) {
+                for (Object rawEntry : rawEffects) {
+                    if (!(rawEntry instanceof Map<?, ?> entry)) {
+                        continue;
+                    }
+                    Object effObj = entry.get("effect");
+                    if (effObj == null) {
+                        continue;
+                    }
+                    PotionEffectType effType = parseEffectType(effObj.toString());
+                    if (effType == null) {
+                        continue;
+                    }
+                    int duration = entry.containsKey("duration") && entry.get("duration") != null
+                        ? Integer.parseInt(entry.get("duration").toString())
+                        : 40;
+                    int amplifier = entry.containsKey("amplifier") && entry.get("amplifier") != null
+                        ? Integer.parseInt(entry.get("amplifier").toString())
+                        : 0;
+                    attackEffects.add(new AttackEffectSpec(effType, duration, amplifier));
                 }
-                PotionEffectType effType = parseEffectType(effObj.toString());
-                if (effType == null) {
-                    continue;
-                }
-                int duration = entry.containsKey("duration") ? Integer.parseInt(entry.get("duration").toString()) : 40;
-                int amplifier = entry.containsKey("amplifier") ? Integer.parseInt(entry.get("amplifier").toString()) : 0;
-                attackEffects.add(new AttackEffectSpec(effType, duration, amplifier));
             }
 
             if (skinFile != null && !skinFile.isBlank()) {
