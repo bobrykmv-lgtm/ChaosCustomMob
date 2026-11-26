@@ -2,6 +2,7 @@ package com.chaossmp.custommob;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
@@ -9,6 +10,7 @@ import org.bukkit.Registry;
 import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -32,6 +34,7 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
 import java.io.IOException;
@@ -39,20 +42,25 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     private NamespacedKey npcIdKey;
     private File skinsFolder;
     private File npcsFolder;
+    private BukkitTask randomSpawnTask;
 
     private final Map<String, NpcProfile> profiles = new LinkedHashMap<>();
-    private final Map<String, UUID> activeEntities = new HashMap<>();
+    private final Map<String, Set<UUID>> activeEntities = new HashMap<>();
+    private final Map<String, Long> nextAllowedRandomRoll = new HashMap<>();
 
     private enum Behavior {
         PEACEFUL,
@@ -71,6 +79,23 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         }
     }
 
+    private enum SpawnMode {
+        NEAR_MOB,
+        NEAR_PLAYER,
+        RANDOM_WORLD;
+
+        static SpawnMode fromString(String value) {
+            if (value == null) {
+                return NEAR_MOB;
+            }
+            return switch (value.trim().toUpperCase(Locale.ROOT)) {
+                case "NEAR_PLAYER", "PLAYER", "RANDOM_PLAYER" -> NEAR_PLAYER;
+                case "RANDOM_WORLD", "WORLD", "RANDOM" -> RANDOM_WORLD;
+                default -> NEAR_MOB;
+            };
+        }
+    }
+
     private record AttackEffectSpec(PotionEffectType type, int duration, int amplifier) {}
 
     private record NpcProfile(
@@ -80,10 +105,14 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         EntityType entityType,
         Behavior behavior,
         String worldName,
-        double x,
-        double y,
-        double z,
         int respawnSeconds,
+        SpawnMode spawnMode,
+        double spawnChance,
+        int spawnIntervalSeconds,
+        double spawnRadius,
+        int maxActive,
+        boolean fallbackToWorld,
+        boolean debugLogs,
         double health,
         double damage,
         double speed,
@@ -96,15 +125,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         ItemStack mainHand,
         List<String> onInteractMessages,
         List<AttackEffectSpec> onAttackEffects
-    ) {
-        Location toLocation() {
-            World world = Bukkit.getWorld(worldName);
-            if (world == null) {
-                return null;
-            }
-            return new Location(world, x, y, z);
-        }
-    }
+    ) {}
 
     @Override
     public void onEnable() {
@@ -121,15 +142,188 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         }
 
         if (getConfig().getBoolean("settings.auto-spawn-on-start", true)) {
-            Bukkit.getScheduler().runTask(this, this::spawnAllProfiles);
+            Bukkit.getScheduler().runTask(this, this::spawnInitialGuaranteed);
         }
 
+        startRandomSpawnLoop();
         getLogger().info("ChaosCustomMob успешно запущен! Загружено NPC: " + profiles.size());
     }
 
     @Override
     public void onDisable() {
+        if (randomSpawnTask != null) {
+            randomSpawnTask.cancel();
+            randomSpawnTask = null;
+        }
         despawnAllTracked();
+    }
+
+    private void startRandomSpawnLoop() {
+        if (randomSpawnTask != null) {
+            randomSpawnTask.cancel();
+        }
+        randomSpawnTask = Bukkit.getScheduler().runTaskTimer(this, this::tickRandomSpawns, 20L, 20L);
+    }
+
+    private void tickRandomSpawns() {
+        long now = System.currentTimeMillis();
+        for (NpcProfile profile : profiles.values()) {
+            if (!profile.enabled()) {
+                continue;
+            }
+
+            long nextTime = nextAllowedRandomRoll.getOrDefault(profile.id(), 0L);
+            if (now < nextTime) {
+                continue;
+            }
+
+            long intervalMs = Math.max(1, profile.spawnIntervalSeconds()) * 1000L;
+            nextAllowedRandomRoll.put(profile.id(), now + intervalMs);
+
+            cleanupDeadEntities(profile.id());
+            int currentCount = activeEntities.getOrDefault(profile.id(), Set.of()).size();
+            if (currentCount >= profile.maxActive()) {
+                if (profile.debugLogs()) {
+                    getLogger().info("[DEBUG " + profile.id() + "] Пропуск: достигнут лимит max-active (" + currentCount + "/" + profile.maxActive() + ")");
+                }
+                continue;
+            }
+
+            double roll = ThreadLocalRandom.current().nextDouble();
+            if (roll > profile.spawnChance()) {
+                if (profile.debugLogs()) {
+                    getLogger().info("[DEBUG " + profile.id() + "] Шанс не сработал: roll=" + String.format(Locale.ROOT, "%.4f", roll) + " > chance=" + profile.spawnChance());
+                }
+                continue;
+            }
+
+            Location targetLoc = pickSpawnLocation(profile);
+            if (targetLoc != null) {
+                LivingEntity spawned = spawnNpcAt(profile, targetLoc);
+                if (spawned != null && profile.debugLogs()) {
+                    getLogger().info("[DEBUG " + profile.id() + "] Успешный рандомный спавн в мире '" + profile.worldName() + "' на "
+                        + targetLoc.getBlockX() + ", " + targetLoc.getBlockY() + ", " + targetLoc.getBlockZ());
+                }
+            } else if (profile.debugLogs()) {
+                getLogger().info("[DEBUG " + profile.id() + "] Шанс сработал, но не найдена точка спавна в мире '" + profile.worldName() + "'");
+            }
+        }
+    }
+
+    private Location pickSpawnLocation(NpcProfile profile) {
+        World world = Bukkit.getWorld(profile.worldName());
+        if (world == null) {
+            getLogger().warning("Мир '" + profile.worldName() + "' для NPC '" + profile.id() + "' не загружен.");
+            return null;
+        }
+
+        Location loc = switch (profile.spawnMode()) {
+            case NEAR_MOB -> findNearRegularMob(world, profile.spawnRadius());
+            case NEAR_PLAYER -> findNearPlayer(world, profile.spawnRadius());
+            case RANDOM_WORLD -> findRandomLoadedGround(world);
+        };
+
+        if (loc == null && profile.fallbackToWorld()) {
+            loc = findRandomLoadedGround(world);
+        }
+        return loc;
+    }
+
+    private Location findNearRegularMob(World world, double radius) {
+        List<LivingEntity> candidates = new ArrayList<>();
+        for (LivingEntity entity : world.getLivingEntities()) {
+            if (entity instanceof Player || entity.isDead() || !entity.isValid()) {
+                continue;
+            }
+            if (entity.getPersistentDataContainer().has(npcIdKey, PersistentDataType.STRING)) {
+                continue;
+            }
+            candidates.add(entity);
+        }
+
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        LivingEntity anchor = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        Location anchorLoc = anchor.getLocation().clone();
+
+        Location around = randomSafeGroundAround(world, anchorLoc.getX(), anchorLoc.getY(), anchorLoc.getZ(), radius);
+        if (around != null) {
+            return around;
+        }
+        return anchorLoc.add(1.0, 0.0, 0.0);
+    }
+
+    private Location findNearPlayer(World world, double radius) {
+        List<Player> players = new ArrayList<>();
+        for (Player p : world.getPlayers()) {
+            if (p.isOnline() && !p.isDead()) {
+                players.add(p);
+            }
+        }
+        if (players.isEmpty()) {
+            return null;
+        }
+        Player chosen = players.get(ThreadLocalRandom.current().nextInt(players.size()));
+        Location pLoc = chosen.getLocation();
+        Location around = randomSafeGroundAround(world, pLoc.getX(), pLoc.getY(), pLoc.getZ(), radius);
+        return around != null ? around : pLoc.clone().add(2.0, 0.0, 0.0);
+    }
+
+    private Location findRandomLoadedGround(World world) {
+        Chunk[] chunks = world.getLoadedChunks();
+        if (chunks.length == 0) {
+            return null;
+        }
+
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        for (int attempt = 0; attempt < 16; attempt++) {
+            Chunk chunk = chunks[rng.nextInt(chunks.length)];
+            int x = (chunk.getX() << 4) + rng.nextInt(0, 16);
+            int z = (chunk.getZ() << 4) + rng.nextInt(0, 16);
+
+            int y = world.getHighestBlockYAt(x, z);
+            Block ground = world.getBlockAt(x, y, z);
+            Block feet = world.getBlockAt(x, y + 1, z);
+            Block head = world.getBlockAt(x, y + 2, z);
+
+            if (ground.getType().isSolid() && !ground.isLiquid() && feet.isPassable() && !feet.isLiquid() && head.isPassable()) {
+                return new Location(world, x + 0.5, y + 1.0, z + 0.5);
+            }
+        }
+        return null;
+    }
+
+    private Location randomSafeGroundAround(World world, double centerX, double centerY, double centerZ, double radius) {
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        int baseY = (int) Math.floor(centerY);
+
+        for (int attempt = 0; attempt < 10; attempt++) {
+            double angle = rng.nextDouble(0.0, Math.PI * 2.0);
+            double dist = Math.sqrt(rng.nextDouble()) * Math.max(1.0, radius);
+            int x = (int) Math.floor(centerX + Math.cos(angle) * dist);
+            int z = (int) Math.floor(centerZ + Math.sin(angle) * dist);
+
+            if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+                continue;
+            }
+
+            for (int dy = 4; dy >= -4; dy--) {
+                int y = baseY + dy;
+                if (y <= world.getMinHeight() || y >= world.getMaxHeight() - 2) {
+                    continue;
+                }
+                Block ground = world.getBlockAt(x, y, z);
+                Block feet = world.getBlockAt(x, y + 1, z);
+                Block head = world.getBlockAt(x, y + 2, z);
+
+                if (ground.getType().isSolid() && !ground.isLiquid() && feet.isPassable() && !feet.isLiquid() && head.isPassable()) {
+                    return new Location(world, x + 0.5, y + 1.0, z + 0.5);
+                }
+            }
+        }
+        return null;
     }
 
     private void setupFoldersAndExample() {
@@ -168,12 +362,17 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
                 name: "&6Страж Таверны"
                 behavior: neutral # peaceful | neutral | hostile
 
-                location:
-                  world: "world"
-                  x: 0.5
-                  y: 65.0
-                  z: 0.5
-                  respawn-seconds: 60
+                world: "world"
+                respawn-seconds: 60
+
+                spawn:
+                  mode: "NEAR_MOB" # NEAR_MOB | NEAR_PLAYER | RANDOM_WORLD
+                  chance: 0.25
+                  interval-seconds: 30
+                  radius: 16.0
+                  max-active: 1
+                  fallback-to-world: true
+                  debug-logs: false
 
                 stats:
                   health: 80.0
@@ -205,6 +404,8 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
 
     private void loadNpcProfiles() {
         profiles.clear();
+        nextAllowedRandomRoll.clear();
+
         File[] files = npcsFolder.listFiles((dir, name) -> name.toLowerCase(Locale.ROOT).endsWith(".yml"));
         if (files == null) {
             return;
@@ -223,14 +424,22 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             boolean enabled = cfg.getBoolean("enabled", true);
             String name = color(cfg.getString("name", id));
             Behavior behavior = Behavior.fromString(cfg.getString("behavior", "neutral"));
-
             EntityType entityType = parseEntityType(cfg.getString("entity-type"), behavior);
 
-            String worldName = cfg.getString("location.world", "world");
-            double x = cfg.getDouble("location.x", 0.0);
-            double y = cfg.getDouble("location.y", 65.0);
-            double z = cfg.getDouble("location.z", 0.0);
-            int respawnSeconds = cfg.getInt("location.respawn-seconds", defaultRespawn);
+            String worldName = cfg.contains("world")
+                ? cfg.getString("world", "world")
+                : cfg.getString("location.world", "world");
+            int respawnSeconds = cfg.contains("respawn-seconds")
+                ? cfg.getInt("respawn-seconds", defaultRespawn)
+                : cfg.getInt("location.respawn-seconds", defaultRespawn);
+
+            SpawnMode spawnMode = SpawnMode.fromString(cfg.getString("spawn.mode", "NEAR_MOB"));
+            double spawnChance = clamp01(cfg.getDouble("spawn.chance", 0.1));
+            int spawnIntervalSeconds = Math.max(1, cfg.getInt("spawn.interval-seconds", 30));
+            double spawnRadius = Math.max(1.0, cfg.getDouble("spawn.radius", 16.0));
+            int maxActive = Math.max(1, cfg.getInt("spawn.max-active", 1));
+            boolean fallbackToWorld = cfg.getBoolean("spawn.fallback-to-world", true);
+            boolean debugLogs = cfg.getBoolean("spawn.debug-logs", false);
 
             double health = cfg.getDouble("stats.health", 40.0);
             double damage = cfg.getDouble("stats.damage", 6.0);
@@ -284,12 +493,19 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
 
             profiles.put(id, new NpcProfile(
                 id, enabled, name, entityType, behavior,
-                worldName, x, y, z, respawnSeconds,
+                worldName, respawnSeconds,
+                spawnMode, spawnChance, spawnIntervalSeconds, spawnRadius, maxActive, fallbackToWorld, debugLogs,
                 health, damage, speed, glowing, skinFile,
                 helmet, chestplate, leggings, boots, mainHand,
                 interactMessages, attackEffects
             ));
         }
+    }
+
+    private double clamp01(double val) {
+        if (val < 0.0) return 0.0;
+        if (val > 1.0) return 1.0;
+        return val;
     }
 
     private EntityType parseEntityType(String configured, Behavior behavior) {
@@ -349,15 +565,31 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             return null;
         }
 
-        Location loc = profile.toLocation();
+        Location loc = pickSpawnLocation(profile);
         if (loc == null) {
-            getLogger().warning("Мир '" + profile.worldName() + "' для NPC '" + id + "' не загружен.");
+            World world = Bukkit.getWorld(profile.worldName());
+            if (world == null) {
+                getLogger().warning("Мир '" + profile.worldName() + "' для NPC '" + id + "' не загружен.");
+            } else {
+                getLogger().warning("Не удалось найти подходящую точку спавна в мире '" + profile.worldName() + "' для NPC '" + id + "'.");
+            }
             return null;
         }
 
-        UUID previousUuid = activeEntities.remove(id);
-        if (previousUuid != null) {
-            Entity old = Bukkit.getEntity(previousUuid);
+        return spawnNpcAt(profile, loc);
+    }
+
+    private LivingEntity spawnNpcAt(NpcProfile profile, Location loc) {
+        if (loc.getWorld() == null) {
+            return null;
+        }
+
+        cleanupDeadEntities(profile.id());
+        Set<UUID> tracked = activeEntities.computeIfAbsent(profile.id(), k -> new HashSet<>());
+        while (tracked.size() >= profile.maxActive()) {
+            UUID oldest = tracked.iterator().next();
+            tracked.remove(oldest);
+            Entity old = Bukkit.getEntity(oldest);
             if (old != null && old.isValid()) {
                 old.remove();
             }
@@ -382,7 +614,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             switch (profile.behavior()) {
                 case PEACEFUL -> mob.setTarget(null);
                 case NEUTRAL -> {
-                    // Атакует только в ответ на удар (обрабатывается в EntityDamageByEntityEvent)
+                    // Атакует только в ответ на удар
                 }
                 case HOSTILE -> {
                     Player nearest = findNearestPlayer(loc, 16.0);
@@ -408,8 +640,19 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             eq.setItemInMainHandDropChance(0.0f);
         }
 
-        activeEntities.put(profile.id(), entity.getUniqueId());
+        tracked.add(entity.getUniqueId());
         return entity;
+    }
+
+    private void cleanupDeadEntities(String id) {
+        Set<UUID> tracked = activeEntities.get(id);
+        if (tracked == null) {
+            return;
+        }
+        tracked.removeIf(uuid -> {
+            Entity e = Bukkit.getEntity(uuid);
+            return e == null || !e.isValid() || e.isDead();
+        });
     }
 
     private Player findNearestPlayer(Location origin, double radius) {
@@ -436,17 +679,21 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
         }
     }
 
-    public void spawnAllProfiles() {
-        for (String id : profiles.keySet()) {
-            spawnNpc(id);
+    public void spawnInitialGuaranteed() {
+        for (NpcProfile profile : profiles.values()) {
+            if (profile.enabled() && profile.spawnChance() >= 1.0) {
+                spawnNpc(profile.id());
+            }
         }
     }
 
     public void despawnAllTracked() {
-        for (UUID uuid : activeEntities.values()) {
-            Entity entity = Bukkit.getEntity(uuid);
-            if (entity != null && entity.isValid()) {
-                entity.remove();
+        for (Set<UUID> set : activeEntities.values()) {
+            for (UUID uuid : set) {
+                Entity entity = Bukkit.getEntity(uuid);
+                if (entity != null && entity.isValid()) {
+                    entity.remove();
+                }
             }
         }
         activeEntities.clear();
@@ -509,9 +756,13 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             return;
         }
 
-        activeEntities.remove(npcId, entity.getUniqueId());
+        Set<UUID> tracked = activeEntities.get(npcId);
+        if (tracked != null) {
+            tracked.remove(entity.getUniqueId());
+        }
+
         NpcProfile profile = profiles.get(npcId);
-        if (profile != null && profile.enabled() && profile.respawnSeconds() > 0) {
+        if (profile != null && profile.enabled() && profile.respawnSeconds() > 0 && profile.spawnChance() >= 1.0) {
             Bukkit.getScheduler().runTaskLater(this, () -> spawnNpc(npcId), profile.respawnSeconds() * 20L);
         }
     }
@@ -550,7 +801,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
             }
             case "respawn" -> {
                 despawnAllTracked();
-                spawnAllProfiles();
+                spawnInitialGuaranteed();
                 sender.sendMessage(prefix() + "§aВсе NPC переспавнены!");
             }
             case "reload" -> {
@@ -558,7 +809,7 @@ public final class ChaosCustomMobPlugin extends JavaPlugin implements Listener, 
                 despawnAllTracked();
                 loadNpcProfiles();
                 if (getConfig().getBoolean("settings.auto-spawn-on-start", true)) {
-                    spawnAllProfiles();
+                    spawnInitialGuaranteed();
                 }
                 sender.sendMessage(prefix() + color(getConfig().getString("messages.reloaded", "&aПерезагружено!")));
             }
